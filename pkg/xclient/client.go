@@ -88,6 +88,7 @@ func New(acc *account.Account, opts ...Option) (*Client, error) {
 		cl.tx = transaction.NewProvider(
 			transaction.WithHTTPClient(cl.httpClient),
 			transaction.WithUserAgent(ua),
+			transaction.WithCookie(acc.Cookie()),
 		)
 	}
 	return cl, nil

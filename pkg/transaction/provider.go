@@ -19,6 +19,7 @@ const DefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 type Provider struct {
 	httpClient *http.Client
 	userAgent  string
+	cookie     string
 	ttl        time.Duration
 
 	mu        sync.Mutex
@@ -33,6 +34,13 @@ type ProviderOption func(*Provider)
 // API client so both present the same TLS fingerprint).
 func WithHTTPClient(c *http.Client) ProviderOption {
 	return func(p *Provider) { p.httpClient = c }
+}
+
+// WithCookie sets the Cookie header for fetching x.com. Required because the
+// ondemand.s reference is only present in the authenticated (logged-in)
+// homepage HTML, not the logged-out version.
+func WithCookie(cookie string) ProviderOption {
+	return func(p *Provider) { p.cookie = cookie }
 }
 
 // WithUserAgent sets the User-Agent used when fetching x.com.
@@ -114,6 +122,9 @@ func (p *Provider) fetch(rawURL string) (string, error) {
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	req.Header.Set("Referer", "https://x.com")
 	req.Header.Set("Cache-Control", "no-cache")
+	if p.cookie != "" {
+		req.Header.Set("Cookie", p.cookie)
+	}
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {

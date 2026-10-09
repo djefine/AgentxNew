@@ -7,6 +7,7 @@ package agent
 import (
 	"context"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -34,13 +35,33 @@ type Agent struct {
 // derives the x-client-transaction-id keys from x.com) is shared across all
 // accounts because those keys are account-independent.
 func New(store *account.Store) *Agent {
-	hc := &http.Client{Timeout: 30 * time.Second}
+	// Use proxy from environment (required on servers with mandatory egress proxy)
+	proxyHC := &http.Client{Timeout: 30 * time.Second}
+	if proxyURL := proxyFromEnv(); proxyURL != "" {
+		if u, err := url.Parse(proxyURL); err == nil {
+			proxyHC.Transport = &http.Transport{Proxy: http.ProxyURL(u)}
+		}
+	}
 	return &Agent{
 		store:   store,
-		tx:      transaction.NewProvider(transaction.WithHTTPClient(hc)),
-		fx:      fxtwitter.New(hc),
+		tx:      transaction.NewProvider(transaction.WithHTTPClient(proxyHC)),
+		fx:      fxtwitter.New(proxyHC),
 		clients: map[string]*xclient.Client{},
 	}
+}
+
+// proxyFromEnv returns the HTTPS proxy URL from environment.
+func proxyFromEnv() string {
+	if p := os.Getenv("https_proxy"); p != "" {
+		return p
+	}
+	if p := os.Getenv("HTTPS_PROXY"); p != "" {
+		return p
+	}
+	if p := os.Getenv("http_proxy"); p != "" {
+		return p
+	}
+	return os.Getenv("HTTP_PROXY")
 }
 
 // Store exposes the underlying account store for management commands.
@@ -57,7 +78,7 @@ func (a *Agent) client(name string) (*xclient.Client, error) {
 	if cl, ok := a.clients[acc.Name]; ok {
 		return cl, nil
 	}
-	opts := []xclient.Option{xclient.WithTransactionProvider(a.tx)}
+	opts := []xclient.Option{}
 	if os.Getenv("AGENTX_UTLS") != "" {
 		// opt-in Chrome-like TLS fingerprint for authenticated traffic
 		opts = append(opts, xclient.WithUTLS())

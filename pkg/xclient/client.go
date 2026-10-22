@@ -90,6 +90,12 @@ func New(acc *account.Account, opts ...Option) (*Client, error) {
 			transaction.WithUserAgent(ua),
 			transaction.WithCookie(acc.Cookie()),
 		)
+	} else {
+		// A provider shared across accounts (see agent.New) is created without
+		// cookies, and x.com only serves the chunk map the transaction-id
+		// generator needs to an authenticated session — so make sure this
+		// account's cookies are used for the home-page fetch.
+		cl.tx.SetCookie(acc.Cookie())
 	}
 	return cl, nil
 }
@@ -226,6 +232,7 @@ func (c *Client) attempt(ctx context.Context, method, fullURL, path string, body
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
 	captureRateLimit(resp.Header)
+	dumpRaw(method, path, resp.StatusCode, respBody)
 
 	switch resp.StatusCode {
 	case http.StatusOK:
@@ -247,10 +254,13 @@ func (c *Client) setHeaders(req *http.Request, method, path string, hasBody, wri
 	txid, err := c.tx.TransactionID(method, path)
 	if err != nil {
 		// transaction id is best-effort; reads often succeed without it, but
-		// writes almost always need it, so fail writes loudly.
+		// writes almost always need it, so fail writes loudly. Read the cause
+		// out loud too: a silent unsigned request hides real breakage (x.com
+		// changing the home page shape, expired cookies) until a write fails.
 		if write {
-			return xerrors.Wrap(xerrors.APIError, err, "generate x-client-transaction-id")
+			return xerrors.Wrap(xerrors.APIError, err, "generate x-client-transaction-id: %v", err)
 		}
+		fmt.Fprintf(os.Stderr, "agentx: warning: x-client-transaction-id unavailable (%v); sending request unsigned\n", err)
 		txid = ""
 	}
 
@@ -443,6 +453,23 @@ func (c *Client) DownloadMedia(ctx context.Context, rawURL string) ([]byte, stri
 		return nil, "", xerrors.New(xerrors.APIError, "media download returned %d", resp.StatusCode)
 	}
 	return body, resp.Header.Get("Content-Type"), nil
+}
+
+// dumpRaw appends the raw response to the file named by AGENTX_DUMP_RAW (opt-in
+// debugging). GraphQL answers HTTP 200 even for rejected operations, and the
+// typed error mapping summarises those bodies — this shows exactly what x.com
+// sent, which is the only way to tell "succeeded" from "silently did nothing".
+func dumpRaw(method, path string, status int, body []byte) {
+	f := os.Getenv("AGENTX_DUMP_RAW")
+	if f == "" {
+		return
+	}
+	fh, err := os.OpenFile(f, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	defer fh.Close()
+	fmt.Fprintf(fh, "=== %s %s -> %d\n%s\n", method, path, status, truncate(string(body), 4000))
 }
 
 // restErrorMessage extracts the message from a v1.1 {"errors":[{...}]} body,

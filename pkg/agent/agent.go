@@ -35,33 +35,30 @@ type Agent struct {
 // derives the x-client-transaction-id keys from x.com) is shared across all
 // accounts because those keys are account-independent.
 func New(store *account.Store) *Agent {
-	// Use proxy from environment (required on servers with mandatory egress proxy)
-	proxyHC := &http.Client{Timeout: 30 * time.Second}
+	hc := &http.Client{Timeout: 30 * time.Second}
+	// Servers with a mandatory egress proxy: the shared provider and FxTwitter use the
+	// environment proxy (account traffic keeps each account's own proxy). See agentx-proxy.sh.
 	if proxyURL := proxyFromEnv(); proxyURL != "" {
 		if u, err := url.Parse(proxyURL); err == nil {
-			proxyHC.Transport = &http.Transport{Proxy: http.ProxyURL(u)}
+			hc.Transport = &http.Transport{Proxy: http.ProxyURL(u)}
 		}
 	}
 	return &Agent{
 		store:   store,
-		tx:      transaction.NewProvider(transaction.WithHTTPClient(proxyHC)),
-		fx:      fxtwitter.New(proxyHC),
+		tx:      transaction.NewProvider(transaction.WithHTTPClient(hc)),
+		fx:      fxtwitter.New(hc),
 		clients: map[string]*xclient.Client{},
 	}
 }
 
-// proxyFromEnv returns the HTTPS proxy URL from environment.
+// proxyFromEnv returns the HTTPS proxy URL from the environment.
 func proxyFromEnv() string {
-	if p := os.Getenv("https_proxy"); p != "" {
-		return p
+	for _, k := range []string{"https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"} {
+		if p := os.Getenv(k); p != "" {
+			return p
+		}
 	}
-	if p := os.Getenv("HTTPS_PROXY"); p != "" {
-		return p
-	}
-	if p := os.Getenv("http_proxy"); p != "" {
-		return p
-	}
-	return os.Getenv("HTTP_PROXY")
+	return ""
 }
 
 // Store exposes the underlying account store for management commands.
@@ -78,7 +75,7 @@ func (a *Agent) client(name string) (*xclient.Client, error) {
 	if cl, ok := a.clients[acc.Name]; ok {
 		return cl, nil
 	}
-	opts := []xclient.Option{}
+	opts := []xclient.Option{xclient.WithTransactionProvider(a.tx)}
 	if os.Getenv("AGENTX_UTLS") != "" {
 		// opt-in Chrome-like TLS fingerprint for authenticated traffic
 		opts = append(opts, xclient.WithUTLS())
@@ -524,20 +521,27 @@ func limitUserPage(p *models.UserPage, count int) *models.UserPage {
 // Tweet fetches a single tweet. With an account it uses the authenticated API;
 // without one it transparently falls back to the zero-auth FxTwitter backend.
 func (a *Agent) Tweet(ctx context.Context, accountName, tweetID string) (*models.Tweet, error) {
+	// An explicitly requested account that cannot be resolved must fail loudly:
+	// falling through to the unauthenticated FxTwitter path would otherwise look
+	// like success for an account name that does not exist.
+	var accountErr error
 	if a.hasAccounts() || accountName != "" {
 		cl, err := a.client(accountName)
-		if err == nil {
-			if page, derr := cl.TweetDetail(ctx, tweetID); derr == nil {
-				for i := range page.Tweets {
-					if page.Tweets[i].ID == tweetID {
-						return &page.Tweets[i], nil
-					}
-				}
-				if len(page.Tweets) > 0 {
-					return &page.Tweets[0], nil
+		if err != nil {
+			accountErr = err
+		} else if page, derr := cl.TweetDetail(ctx, tweetID); derr == nil {
+			for i := range page.Tweets {
+				if page.Tweets[i].ID == tweetID {
+					return &page.Tweets[i], nil
 				}
 			}
+			if len(page.Tweets) > 0 {
+				return &page.Tweets[0], nil
+			}
 		}
+	}
+	if accountName != "" && accountErr != nil {
+		return nil, accountErr
 	}
 	return a.fx.GetTweet(ctx, tweetID)
 }

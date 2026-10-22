@@ -17,6 +17,8 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"time"
@@ -183,7 +185,14 @@ type errObj struct {
 	Message string `json:"message"`
 }
 
+// emit writes the success envelope. A nil slice is written as an empty array so
+// list commands keep the documented contract (".data is an array") when a page
+// comes back with no entries — x.com does that for real, e.g. a media tab asked
+// with a very small count returns only cursors.
 func emit(data any, page *pagination) {
+	if rv := reflect.ValueOf(data); rv.IsValid() && rv.Kind() == reflect.Slice && rv.IsNil() {
+		data = []any{}
+	}
 	enc := json.NewEncoder(os.Stdout)
 	if pretty {
 		enc.SetIndent("", "  ")
@@ -1208,8 +1217,28 @@ func cmdDownload(ctx context.Context, args []string) {
 			fail(err)
 		}
 		name := out
-		if name == "" || len(urls) > 1 {
+		// --out is a *file* only when exactly one file is being written to it.
+		// Otherwise (--all, or a path that is/trails a directory) it is a
+		// destination directory: join the generated name onto it instead of
+		// discarding the caller's path and dumping files in the cwd.
+		if len(urls) > 1 || isDirPath(out) {
+			dir := out
+			if dir == "" {
+				dir = "."
+			}
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				fail(xerrors.New(xerrors.APIError, "mkdir %q: %v", dir, err))
+			}
+			name = filepath.Join(dir, mediaFilename(u, ct))
+		} else if name == "" {
 			name = mediaFilename(u, ct)
+		}
+		// The destination directory may not exist yet; mirror the multi-file
+		// behaviour instead of failing on a missing parent.
+		if dir := filepath.Dir(name); dir != "" && dir != "." {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				fail(xerrors.New(xerrors.APIError, "mkdir %q: %v", dir, err))
+			}
 		}
 		if err := os.WriteFile(name, data, 0o644); err != nil {
 			fail(xerrors.New(xerrors.APIError, "write %q: %v", name, err))
@@ -1654,6 +1683,20 @@ func redactSecret(s string) string {
 	return "…" + s[len(s)-4:]
 }
 
+// isDirPath reports whether p should be treated as a destination directory
+// rather than a file name: an existing directory, or a path with a trailing
+// separator (which lets a caller name a directory that does not exist yet).
+func isDirPath(p string) bool {
+	if p == "" {
+		return false
+	}
+	if strings.HasSuffix(p, "/") || strings.HasSuffix(p, string(filepath.Separator)) {
+		return true
+	}
+	fi, err := os.Stat(p)
+	return err == nil && fi.IsDir()
+}
+
 // mediaFilename derives a local filename from a media URL, appending an
 // extension from the Content-Type when the URL path has none.
 func mediaFilename(rawURL, contentType string) string {
@@ -1684,9 +1727,18 @@ func mediaFilename(rawURL, contentType string) string {
 
 var tweetIDRegex = regexp.MustCompile(`(\d{6,})`)
 
+// statusIDRegex pulls the id out of a /status/<id> (or /statuses/<id>) URL. The
+// older numeric-run regex demanded 6+ digits, so a short id such as
+// https://x.com/jack/status/20 was never extracted and the whole URL was sent to
+// x.com as the tweet id.
+var statusIDRegex = regexp.MustCompile(`/status(?:es)?/(\d+)`)
+
 func parseTweetID(s string) string {
 	s = strings.TrimSpace(s)
 	if strings.Contains(s, "/") {
+		if m := statusIDRegex.FindStringSubmatch(s); len(m) == 2 {
+			return m[1]
+		}
 		if m := tweetIDRegex.FindAllString(s, -1); len(m) > 0 {
 			return m[len(m)-1]
 		}
